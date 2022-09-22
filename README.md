@@ -1,4 +1,5 @@
-# multifunction-interrupt-button
+# MFIButton
+## A MultiFunction Interrupt Button library
 An Arduino library for easy multifunctional use of buttons, purely using
 interrupts.
 
