@@ -2,6 +2,9 @@
 
 #include "assert.h"
 
+// TODO: Make time math resilient to clock overflow wraps
+// TODO: Add the option to only fire a long press at release
+
 struct MFIButton::all_buttons_head_ MFIButton::started_buttons_ =
     SLIST_HEAD_INITIALIZER(started_buttons_);
 
