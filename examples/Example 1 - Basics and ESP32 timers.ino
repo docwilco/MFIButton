@@ -1,4 +1,3 @@
-#include <Arduino.h>
 #include <MFIButton.h>
 
 // Define your button pins here
