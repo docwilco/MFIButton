@@ -2,23 +2,17 @@
 
 #include "assert.h"
 
-static SLIST_CLASS_HEAD(all_buttons_head_, MFIButton)
-    started_buttons_ = SLIST_HEAD_INITIALIZER(started_buttons_);
+struct MFIButton::all_buttons_head_ MFIButton::started_buttons_ =
+    SLIST_HEAD_INITIALIZER(started_buttons_);
 
-// This is a double linked list, because we need _INSERT_BEFORE.
-// Inserting timers is done in an interrupt, so should be as fast
-// as possible.
-static LIST_HEAD(timers_head_,
-                 MFIButton::timer_t_) timers_ = LIST_HEAD_INITIALIZER(timers_);
+struct MFIButton::timers_head_ MFIButton::timers_ =
+    TAILQ_HEAD_INITIALIZER(timers_);
 
-MFIButton::MFIButton(int pin, bool pullup, bool inverted) {
-    this->pin_ = pin;
-    this->inverted_ = inverted;
-    this->last_state_ = digitalRead(pin);
-    pinMode(pin, pullup ? INPUT_PULLUP : INPUT);
-}
+MFIButton::timer_callback_t MFIButton::set_timer_ = NULL;
 
 bool MFIButton::begin() {
+    pinMode(pin_, pullup_ ? INPUT_PULLUP : INPUT);
+    this->last_state_ = this->digital_read_();
     // This library doesn't work unless you set up a timer callback
     assert(MFIButton::set_timer_ != NULL);
     // Check if the pin supports interrupts
@@ -39,7 +33,7 @@ void MFIButton::pin_interrupt_handler_() {
     // it once.
     auto now = millis();
     // Iterate through all the buttons that have been started
-    MFIButton *button;
+    MFIButton *button = NULL;
     SLIST_FOREACH(button, &started_buttons_, started_entries_) {
         // First check if we are in a debounce period
         if (now - button->last_press_time_ < button->debounce_time_ ||
@@ -55,17 +49,19 @@ void MFIButton::pin_interrupt_handler_() {
         if (state != button->last_state_) {
             // We always send onPress and onRelease events
             button->send_press_release_(state);
-            if (state) {
-                // Button pressed
+            if (state != true) {
+                // Button pressed is pressed when the pin is LOW
                 // If there are long press callbacks, we need to set a timer
                 // to check if the button is still pressed after the shortest
                 // long press time.
                 long_press_t_ *long_press =
                     SLIST_FIRST(&button->long_press_handlers_);
                 if (long_press != NULL) {
-                    button->set_long_press_timer_(long_press, long_press->duration, now);
+                    button->set_long_press_timer_(long_press,
+                                                  long_press->duration, now);
                 }
                 button->sequence_clicks_++;
+                button->last_press_time_ = now;
             } else {
                 // Button released
                 // First we need to deterimine if this was a click or a
@@ -79,10 +75,15 @@ void MFIButton::pin_interrupt_handler_() {
                 }
                 // Break it out like this to avoid loads & math if possible
                 if (!is_click) {
-                    uint16_t press_time = now - button->last_press_time_;
-                    uint16_t shortest_long_press =
-                        SLIST_FIRST(&button->long_press_handlers_)->duration;
-                    if (press_time < shortest_long_press) {
+                    if (!SLIST_EMPTY(&button->long_press_handlers_)) {
+                        uint16_t press_time = now - button->last_press_time_;
+                        uint16_t shortest_long_press =
+                            SLIST_FIRST(&button->long_press_handlers_)
+                                ->duration;
+                        if (press_time < shortest_long_press) {
+                            is_click = true;
+                        }
+                    } else {
                         is_click = true;
                     }
                 }
@@ -105,22 +106,24 @@ void MFIButton::pin_interrupt_handler_() {
                     // TODO: Support only firing a single long press event, even
                     // if multiple long press handlers are registered.
                 }
+                button->last_release_time_ = now;
             }
+            button->last_state_ = state;
         }
     }
 }
 
-void MFIButton::timer_interrupt_handler_() {
+void MFIButton::timerInterruptHandler() {
     // This won't change throughout the handler, so just read
     // it once.
     auto now = millis();
     // Iterate through all the timers that have been started
-    timer_t_ *timer;
-    LIST_FOREACH(timer, &timers_, entries) {
+    timer_t_ *timer, *tmp;
+    TAILQ_FOREACH_SAFE(timer, &MFIButton::timers_, entries, tmp) {
         // Check if the timer has expired
         if (now >= timer->trigger_time) {
             // Timer has expired, so we need to remove it from the list
-            LIST_REMOVE(timer, entries);
+            TAILQ_REMOVE(&MFIButton::timers_, timer, entries);
             // Switch on type
             switch (timer->type) {
                 case timer_type_t_::TIMER_TYPE_SEQUENCE:
@@ -137,13 +140,13 @@ void MFIButton::timer_interrupt_handler_() {
             // Free the timer
             delete timer;
         } else {
+            // trigger time is in the future
             break;
         }
     }
     if (timer != NULL) {
         // If there are still timers left, we need to set the next timer
-        MFIButton::set_timer_(timer->trigger_time - now,
-                              MFIButton::timer_interrupt_handler_);
+        MFIButton::set_timer_(timer->trigger_time - now);
     }
 }
 
@@ -164,13 +167,20 @@ void MFIButton::check_long_press_(timer_t_ *timer, unsigned long now) {
     if (this->last_release_time_ < this->last_press_time_) {
         // Button is still pressed, so we need to send the long press event
         this->send_long_press_(timer->data.long_press);
+        // Since we're now in a long press, we need to reset the
+        // sequence clicks.
+        this->sequence_clicks_ = 0;
+        // Check if there are any more long press handlers
+        long_press_t_ *next_long_press =
+            SLIST_NEXT(timer->data.long_press, entries);
+        if (next_long_press != NULL) {
+            uint16_t delay =
+                next_long_press->duration - timer->data.long_press->duration;
+            this->set_long_press_timer_(next_long_press, delay, now);
+        }
     }
-    // Check if there are any more long press handlers
-    long_press_t_ *next_long_press = SLIST_NEXT(timer->data.long_press, entries);
-    if (next_long_press != NULL) {
-        uint16_t delay = next_long_press->duration - timer->data.long_press->duration;
-        this->set_long_press_timer_(next_long_press, delay, now);
-    }
+    // if it has been released, nothing to do (for now, we might support
+    // different long press events)
 }
 
 void MFIButton::send_sequence_(uint8_t clicks) {
@@ -188,18 +198,18 @@ void MFIButton::send_sequence_(uint8_t clicks) {
 }
 
 void MFIButton::send_long_press_(long_press_t_ *long_press) {
-    long_press->callback(MFIButtonEvent(MFIButtonEvent::LONG_PRESS, this,
-                                        long_press->duration));
+    long_press->callback(
+        MFIButtonEvent(MFIButtonEvent::LONG_PRESS, this, long_press->duration));
 }
+
 void MFIButton::add_click_release_timer_(unsigned long now) {
+
     timer_t_ *timer = new timer_t_;
     timer->trigger_time = now + this->sequence_delay_;
     timer->type = timer_type_t_::TIMER_TYPE_SEQUENCE;
     timer->button = this;
     timer->data.release_time = now;
-    MFIButton::insert_timer_(timer);
-    MFIButton::set_timer_(this->sequence_delay_,
-                          MFIButton::timer_interrupt_handler_);
+    MFIButton::insert_timer_(timer, now);
 }
 
 void MFIButton::set_long_press_timer_(long_press_t_ *long_press, uint16_t delay,
@@ -210,20 +220,20 @@ void MFIButton::set_long_press_timer_(long_press_t_ *long_press, uint16_t delay,
     timer->type = TIMER_TYPE_LONG_PRESS;
     timer->button = this;
     timer->data.long_press = long_press;
-    MFIButton::insert_timer_(timer);
-    MFIButton::set_timer_(long_press->duration,
-                          MFIButton::timer_interrupt_handler_);
+    MFIButton::insert_timer_(timer, now);
 }
 
 bool MFIButton::digital_read_() {
     // Normally return true if the pin is HIGH, and false if the pin is LOW
     // when inverted, return true if the pin is LOW, and false if the pin is
     // HIGH
-    return this->inverted_ ? !digitalRead(this->pin_) : digitalRead(this->pin_);
+    int value = digitalRead(this->pin_);
+    bool ret = this->inverted_ ? value == LOW : value == HIGH;
+    return ret;
 }
 
 void MFIButton::send_press_release_(bool state) {
-    if (state == true) {
+    if (state != true) {
         // Button pressed
         if (this->on_press_ != NULL) {
             this->on_press_(MFIButtonEvent(MFIButtonEvent::PRESS, this));
@@ -236,52 +246,95 @@ void MFIButton::send_press_release_(bool state) {
     }
 }
 
-void MFIButton::insert_timer_(timer_t_ *timer) {
-    timer_t_ *t;
-    LIST_FOREACH(t, &timers_, entries) {
-        if (timer->trigger_time < t->trigger_time) {
-            LIST_INSERT_BEFORE(t, timer, entries);
-            return;
+void MFIButton::insert_timer_(timer_t_ *timer, unsigned long now) {
+    if (TAILQ_EMPTY(&MFIButton::timers_)) {
+        // No timers, so just add it to the list
+        TAILQ_INSERT_HEAD(&MFIButton::timers_, timer, entries);
+        MFIButton::set_timer_(timer->trigger_time - now);
+    } else {
+        timer_t_ *t;
+        // Iterate through the timers to find the right place to insert
+        TAILQ_FOREACH(t, &MFIButton::timers_, entries) {
+            if (timer->trigger_time < t->trigger_time) {
+                // This timer should be inserted before the current timer
+                TAILQ_INSERT_BEFORE(t, timer, entries);
+                if (timer == TAILQ_FIRST(&MFIButton::timers_)) {
+                    MFIButton::set_timer_(timer->trigger_time - now);
+                }
+                break;
+            }
+        }
+        if (t == NULL) {
+            // This timer should be inserted at the end of the list
+            // and since there actually are shorter timers, no need
+            // to update the timer interrupt
+            TAILQ_INSERT_TAIL(&MFIButton::timers_, timer, entries);
         }
     }
-    LIST_INSERT_AFTER(t, timer, entries);
 }
 
 void MFIButton::onSequence(uint8_t clicks, event_callback_t callback) {
     struct sequence_t_ *sequence = new sequence_t_;
     sequence->clicks = clicks;
     sequence->callback = callback;
-    // Insert the sequence in ascending clicks order.
+    // Insert/replace the sequence in ascending clicks order.
     // SLIST doesn't have _INSERT_BEFORE, so we have to track
     // the previous element.
     struct sequence_t_ *s, *prev = NULL;
-    SLIST_FOREACH(s, &this->sequence_handlers_, entries) {
-        if (clicks < s->clicks) {
-            if (prev == NULL) {
-                SLIST_INSERT_HEAD(&this->sequence_handlers_, sequence, entries);
-            } else {
-                SLIST_INSERT_AFTER(prev, sequence, entries);
+    if (SLIST_EMPTY(&this->sequence_handlers_)) {
+        SLIST_INSERT_HEAD(&this->sequence_handlers_, sequence, entries);
+    } else {
+        SLIST_FOREACH(s, &this->sequence_handlers_, entries) {
+            if (clicks < s->clicks) {
+                if (prev == NULL) {
+                    SLIST_INSERT_HEAD(&this->sequence_handlers_, sequence,
+                                      entries);
+                } else {
+                    SLIST_INSERT_AFTER(prev, sequence, entries);
+                }
+                break;
             }
-            return;
+            if (clicks == s->clicks) {
+                s->callback = callback;
+                // We don't need the new sequence, so free it
+                delete sequence;
+                break;
+            }
+            prev = s;
         }
-        prev = s;
+        // s will be NULL if we reached the end of the list, and if we reached
+        // the end of the list, that means we haven't inserted or updated.
+        if (s == NULL) {
+            SLIST_INSERT_AFTER(prev, sequence, entries);
+        }
     }
-    SLIST_INSERT_AFTER(s, sequence, entries);
     // Do this after the insert, to avoid the race condition where
     // the code assumes this amount of clicks is in the config, when
     // it hasn't been inserted yet. This way the just inserted
     // handler will be ignored until after this next bit is done.
-    if (longest_sequence_ < clicks) {
-        longest_sequence_ = clicks;
+    if (this->longest_sequence_ < clicks) {
+        this->longest_sequence_ = clicks;
     }
+}
+
+void MFIButton::onSequence(uint8_t clicks, callback_t callback) {
+    this->onSequence(clicks, (event_callback_t)callback);
 }
 
 void MFIButton::onClick(event_callback_t callback) {
     this->onSequence(1, callback);
 }
 
+void MFIButton::onClick(callback_t callback) {
+    this->onSequence(1, (event_callback_t)callback);
+}
+
 void MFIButton::onDoubleClick(event_callback_t callback) {
     this->onSequence(2, callback);
+}
+
+void MFIButton::onDoubleClick(callback_t callback) {
+    this->onSequence(2, (event_callback_t)callback);
 }
 
 void MFIButton::onLongPress(uint16_t duration, event_callback_t callback) {
@@ -292,22 +345,60 @@ void MFIButton::onLongPress(uint16_t duration, event_callback_t callback) {
     // SLIST doesn't have _INSERT_BEFORE, so we have to track
     // the previous element.
     struct long_press_t_ *l, *prev = NULL;
-    SLIST_FOREACH(l, &this->long_press_handlers_, entries) {
-        if (duration < l->duration) {
-            if (prev == NULL) {
-                SLIST_INSERT_HEAD(&this->long_press_handlers_, long_press,
-                                  entries);
-            } else {
-                SLIST_INSERT_AFTER(prev, long_press, entries);
+    if (SLIST_EMPTY(&this->long_press_handlers_)) {
+        SLIST_INSERT_HEAD(&this->long_press_handlers_, long_press, entries);
+    } else {
+        SLIST_FOREACH(l, &this->long_press_handlers_, entries) {
+            if (duration < l->duration) {
+                if (prev == NULL) {
+                    SLIST_INSERT_HEAD(&this->long_press_handlers_, long_press,
+                                      entries);
+                } else {
+                    SLIST_INSERT_AFTER(prev, long_press, entries);
+                }
+                break;
             }
-            return;
+            if (duration == l->duration) {
+                l->callback = callback;
+                // We don't need the new long press, so free it
+                delete long_press;
+                break;
+            }
+            prev = l;
         }
-        prev = l;
+        // l will be NULL if we reached the end of the list, and if we reached
+        // the end of the list, that means we haven't inserted.
+        if (l == NULL) {
+            SLIST_INSERT_AFTER(prev, long_press, entries);
+        }
     }
-    SLIST_INSERT_AFTER(l, long_press, entries);
     // Just like with sequences, we need to make sure the handler
     // is inserted before we up the duration.
     if (longest_long_press_ < duration) {
         longest_long_press_ = duration;
     }
+}
+
+void MFIButton::onLongPress(uint16_t duration, callback_t callback) {
+    this->onLongPress(duration, (event_callback_t)callback);
+}
+
+void MFIButton::onPress(event_callback_t callback) {
+    this->on_press_ = callback;
+}
+
+void MFIButton::onPress(callback_t callback) {
+    this->on_press_ = (event_callback_t)callback;
+}
+
+void MFIButton::onRelease(event_callback_t callback) {
+    this->on_release_ = callback;
+}
+
+void MFIButton::onRelease(callback_t callback) {
+    this->on_release_ = (event_callback_t)callback;
+}
+
+void MFIButton::setInterruptTimerCallback(timer_callback_t callback) {
+    MFIButton::set_timer_ = callback;
 }
